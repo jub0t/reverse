@@ -3,7 +3,7 @@
 
 ### Usaage
 
-```ts
+```zig
 .{
     .name = .zproxy_config,
     .fingerprint = 0x0000000000000001,
