@@ -22,13 +22,12 @@ pub const config = @import("config.zig");
 // ── Logging ───────────────────────────────────────────────────────────────────
 
 pub const std_options = std.Options{
-    .log_level = .debug, // overridden at runtime by cfg.log_level
+    .log_level = .debug,
 };
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
-    // Allocator: SmpAllocator for multi-threaded perf (new in Zig 0.14)
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
@@ -80,6 +79,12 @@ pub fn main() !void {
     const threads = try allocator.alloc(std.Thread, n_workers);
     defer allocator.free(threads);
 
+    // Each worker will publish its Linux TID here so we can pin it
+    const AtomicI32 = std.atomic.Value(i32);
+    const tids = try allocator.alloc(AtomicI32, n_workers);
+    defer allocator.free(tids);
+    for (tids) |*tid| tid.store(0, .release);
+
     for (threads, 0..) |*t, i| {
         const wcfg = worker_mod.WorkerConfig{
             .id = @intCast(i),
@@ -87,13 +92,18 @@ pub fn main() !void {
             .cfg = &cfg,
             .lb = &lb,
             .allocator = allocator,
+            .tid_out = if (!build_options.wsl2) &tids[i] else null,
         };
 
         t.* = try std.Thread.spawn(.{}, worker_mod.workerThread, .{wcfg});
 
-        // Pin thread to CPU core (NUMA-aware on native Linux)
         if (!build_options.wsl2) {
-            pinThreadToCore(t.*, @intCast(i)) catch |err| {
+            // Spin until the worker publishes its real Linux TID
+            var tid: i32 = 0;
+            while (tid == 0) : (std.time.sleep(1 * std.time.ns_per_ms)) {
+                tid = tids[i].load(.acquire);
+            }
+            pinThreadToCore(tid, @intCast(i)) catch |err| {
                 std.log.warn("could not pin worker {d} to core: {}", .{ i, err });
             };
         }
@@ -104,7 +114,6 @@ pub fn main() !void {
     waitForSignal();
 
     std.log.info("shutting down...", .{});
-    // Workers will drain naturally when the listen socket closes
     for (threads) |t| t.join();
     std.log.info("zproxy stopped", .{});
 }
@@ -125,12 +134,8 @@ fn createListenSocket(cfg: Config) !std.posix.fd_t {
     );
     errdefer std.posix.close(fd);
 
-    // SO_REUSEADDR — allow fast restart without TIME_WAIT
     const one: c_int = 1;
     try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEADDR, std.mem.asBytes(&one));
-
-    // SO_REUSEPORT — kernel load-balances connections across all workers
-    // Each worker gets its own socket on the same port. No thundering herd.
     try std.posix.setsockopt(fd, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, std.mem.asBytes(&one));
 
     try std.posix.bind(fd, &addr.any, addr.getOsSockLen());
@@ -148,17 +153,13 @@ fn parseAddr(s: []const u8) !std.net.Address {
         std.net.Address.parseIp(host, port);
 }
 
-/// Pin a thread to a specific CPU core via sched_setaffinity.
-fn pinThreadToCore(thread: std.Thread, core: u32) !void {
+/// Pin a thread (by Linux TID) to a specific CPU core via sched_setaffinity.
+fn pinThreadToCore(tid: i32, core: u32) !void {
     var cpuset = std.mem.zeroes(linux.cpu_set_t);
-    linux.CPU_SET(core % 1024, &cpuset);
-    const tid = thread.impl.handle; // pthreads tid
-    const rc = linux.sched_setaffinity(
-        @intCast(tid),
-        @sizeOf(linux.cpu_set_t),
-        &cpuset,
-    );
-    if (rc != 0) return error.SetAffinityFailed;
+    const idx = (core % 1024) / @bitSizeOf(usize);
+    const bit = @as(usize, 1) << @intCast((core % 1024) % @bitSizeOf(usize));
+    cpuset[idx] |= bit;
+    try linux.sched_setaffinity(tid, &cpuset);
 }
 
 /// Block until SIGINT or SIGTERM.
@@ -171,7 +172,6 @@ fn waitForSignal() void {
     std.posix.sigaction(std.posix.SIG.INT, &sa, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
 
-    // Suspend main thread
     while (!got_signal) {
         std.time.sleep(100 * std.time.ns_per_ms);
     }

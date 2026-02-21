@@ -53,6 +53,10 @@ pub const WorkerConfig = struct {
     /// Allocator backed by NUMA-local memory on native Linux.
     /// On WSL2 this is just a regular GPA slab.
     allocator: std.mem.Allocator,
+    /// Written by the worker thread at startup with its Linux TID so that
+    /// main() can call sched_setaffinity without touching pthread internals.
+    /// Null when CPU pinning is disabled (e.g. wsl2 mode).
+    tid_out: ?*std.atomic.Value(i32) = null,
 };
 
 pub const Worker = struct {
@@ -266,6 +270,12 @@ pub const Worker = struct {
 // ── Thread entrypoint ─────────────────────────────────────────────────────────
 
 pub fn workerThread(wcfg: WorkerConfig) void {
+    // Publish our real Linux TID so main() can pin us to a core via
+    // sched_setaffinity without touching opaque pthread handles.
+    if (wcfg.tid_out) |tid_out| {
+        tid_out.store(@as(i32, @bitCast(linux.gettid())), .release);
+    }
+
     // Use an arena per worker for connection state
     var arena = std.heap.ArenaAllocator.init(wcfg.allocator);
     defer arena.deinit();
