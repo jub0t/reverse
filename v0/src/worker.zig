@@ -1,14 +1,5 @@
 /// worker.zig — per-CPU worker thread
-///
-/// Each worker:
-///   1. Owns one io_uring Ring (see io/ring.zig)
-///   2. Owns one LocalPool of idle upstream connections
-///   3. Runs an event loop: accept connections, parse HTTP, proxy upstream
-///
-/// Workers never share mutable state with each other (except the read-only
-/// LoadBalancer and the atomic counters inside Upstream).
 const std = @import("std");
-const os = std.os;
 const linux = std.os.linux;
 const build_options = @import("build_options");
 
@@ -21,6 +12,10 @@ const LocalPool = pool_mod.LocalPool;
 const LoadBalancer = pool_mod.LoadBalancer;
 const Config = @import("config.zig").Config;
 
+/// Global shutdown flag — set by main on Ctrl+C.
+/// Workers check this every ~100ms via recurring TIMEOUT SQE.
+pub var shutdown_flag = std.atomic.Value(bool).init(false);
+
 // ── Per-connection state ──────────────────────────────────────────────────────
 
 const ConnState = enum {
@@ -32,64 +27,55 @@ const ConnState = enum {
 };
 
 const Conn = struct {
-    client_fd: std.posix.fd_t,
+    client_fd:   std.posix.fd_t,
     upstream_fd: std.posix.fd_t = -1,
-    state: ConnState = .reading_request,
-    /// Partially received request bytes
-    req_buf: [8192]u8 = undefined,
-    req_len: usize = 0,
-    parsed: parser.Request = undefined,
-    upstream: *pool_mod.Upstream = undefined,
-    keepalive: bool = true,
+    state:       ConnState = .reading_request,
+    /// Receive buffer — passed directly to io_uring RECV SQE.
+    /// No provided-buffer ring needed; each conn owns its buffer.
+    req_buf:     [8192]u8 = undefined,
+    req_len:     usize = 0,
+    parsed:      parser.Request = undefined,
+    upstream:    *pool_mod.Upstream = undefined,
+    keepalive:   bool = true,
+};
+
+// ── Worker config ─────────────────────────────────────────────────────────────
+
+pub const WorkerConfig = struct {
+    id:         u32,
+    listen_fd:  std.posix.fd_t,
+    cfg:        *const Config,
+    lb:         *LoadBalancer,
+    allocator:  std.mem.Allocator,
 };
 
 // ── Worker ────────────────────────────────────────────────────────────────────
 
-pub const WorkerConfig = struct {
-    id: u32,
-    listen_fd: std.posix.fd_t,
-    cfg: *const Config,
-    lb: *LoadBalancer,
-    /// Allocator backed by NUMA-local memory on native Linux.
-    /// On WSL2 this is just a regular GPA slab.
-    allocator: std.mem.Allocator,
-    /// Written by the worker thread at startup with its Linux TID so that
-    /// main() can call sched_setaffinity without touching pthread internals.
-    /// Null when CPU pinning is disabled (e.g. wsl2 mode).
-    tid_out: ?*std.atomic.Value(i32) = null,
-};
-
 pub const Worker = struct {
-    wcfg: WorkerConfig,
-    ring: Ring,
+    wcfg:       WorkerConfig,
+    ring:       Ring,
     local_pool: LocalPool,
-    /// Active connections keyed by client fd
-    /// Simple open-addressed hash map: fd -> Conn
-    conns: std.AutoHashMap(std.posix.fd_t, Conn),
-    running: bool = true,
+    conns:      std.AutoHashMap(std.posix.fd_t, Conn),
 
     pub fn init(wcfg: WorkerConfig) !Worker {
         const ring_cfg = RingConfig{
-            .sq_depth = wcfg.cfg.io_uring_sq_depth,
+            .sq_depth  = wcfg.cfg.io_uring_sq_depth,
             .buf_count = wcfg.cfg.io_uring_buf_count,
-            .buf_size = wcfg.cfg.io_uring_buf_size,
-            .buf_group = @intCast(wcfg.id), // unique group per worker
+            .buf_size  = wcfg.cfg.io_uring_buf_size,
+            .buf_group = @intCast(wcfg.id),
         };
 
         var ring = try Ring.init(wcfg.allocator, ring_cfg);
         errdefer ring.deinit();
 
-        var local_pool = try LocalPool.init(
-            wcfg.allocator,
-            wcfg.cfg.upstream.pool_size,
-        );
+        var local_pool = try LocalPool.init(wcfg.allocator, wcfg.cfg.upstream.pool_size);
         errdefer local_pool.deinit(wcfg.allocator);
 
         return Worker{
-            .wcfg = wcfg,
-            .ring = ring,
+            .wcfg       = wcfg,
+            .ring       = ring,
             .local_pool = local_pool,
-            .conns = std.AutoHashMap(std.posix.fd_t, Conn).init(wcfg.allocator),
+            .conns      = std.AutoHashMap(std.posix.fd_t, Conn).init(wcfg.allocator),
         };
     }
 
@@ -99,57 +85,59 @@ pub const Worker = struct {
         self.conns.deinit();
     }
 
-    /// Main event loop. Runs until `self.running` is set to false.
     pub fn run(self: *Worker) !void {
         std.log.info("worker {d} starting (listen_fd={d})", .{
             self.wcfg.id, self.wcfg.listen_fd,
         });
 
-        // Arm multishot accept — one submission, infinite connections
         try self.ring.submitMultishotAccept(self.wcfg.listen_fd);
+        try self.ring.submitTimeout(100);
 
-        while (self.running) {
-            try self.ring.waitAndDispatch(self);
+        while (!shutdown_flag.load(.acquire)) {
+            self.ring.waitAndDispatch(self) catch |err| switch (err) {
+                error.FileDescriptorInvalid,
+                error.Unexpected,
+                => break,
+                else => return err,
+            };
         }
+
+        std.log.info("worker {d} stopped", .{self.wcfg.id});
     }
 
-    // ── CQE handlers (called by Ring.waitAndDispatch) ─────────────────────
+    // ── CQE handlers ─────────────────────────────────────────────────────────
 
     pub fn onAccept(self: *Worker, _: std.posix.fd_t, client_fd: i32) !void {
-        // Set non-blocking (the accept4 via io_uring may not set it)
         _ = linux.fcntl(client_fd, linux.F.SETFL, @as(usize, @as(u32, @bitCast(std.posix.O{ .NONBLOCK = true }))));
 
-        const conn = Conn{ .client_fd = client_fd };
-        try self.conns.put(client_fd, conn);
+        // Insert conn first, then get a stable pointer to pass its buffer
+        try self.conns.put(client_fd, Conn{ .client_fd = client_fd });
+        const conn = self.conns.getPtr(client_fd).?;
 
-        // Arm multishot recv — kernel will deliver data as it arrives
-        try self.ring.submitMultishotRecv(client_fd);
+        // Arm recv pointing directly at this conn's buffer
+        try self.ring.submitRecv(client_fd, &conn.req_buf);
 
         std.log.debug("worker {d} accepted fd={d}", .{ self.wcfg.id, client_fd });
     }
 
-    pub fn onRecv(self: *Worker, client_fd: std.posix.fd_t, data: []u8, buf_idx: u16) !void {
-        _ = buf_idx;
-
-        const conn = self.conns.getPtr(client_fd) orelse {
-            // Stale receive after close — ignore
-            return;
-        };
+    /// Called when a recv CQE fires. `bytes` is the number of bytes received
+    /// into conn.req_buf (already there — no copy needed).
+    pub fn onRecv(self: *Worker, client_fd: std.posix.fd_t, bytes: i32) !void {
+        const conn = self.conns.getPtr(client_fd) orelse return;
 
         switch (conn.state) {
             .reading_request => {
-                // Accumulate into connection's request buffer
-                const available = conn.req_buf.len - conn.req_len;
-                const to_copy = @min(data.len, available);
-                @memcpy(conn.req_buf[conn.req_len .. conn.req_len + to_copy], data[0..to_copy]);
-                conn.req_len += to_copy;
+                conn.req_len += @intCast(bytes);
 
-                // Attempt to parse
                 const consumed = parser.parse(
                     conn.req_buf[0..conn.req_len],
                     &conn.parsed,
                 ) catch |err| switch (err) {
-                    error.NeedMoreData => return, // wait for more bytes
+                    error.NeedMoreData => {
+                        // Re-arm recv into the remainder of the buffer
+                        try self.ring.submitRecv(client_fd, conn.req_buf[conn.req_len..]);
+                        return;
+                    },
                     else => {
                         try self.sendBadRequest(client_fd);
                         return;
@@ -163,7 +151,6 @@ pub const Worker = struct {
                     if (std.ascii.eqlIgnoreCase(v, "keep-alive")) conn.keepalive = true;
                 }
 
-                // Pick an upstream and get/open a connection
                 conn.upstream = self.wcfg.lb.pick();
 
                 if (self.local_pool.pop(conn.upstream)) |ufd| {
@@ -171,19 +158,22 @@ pub const Worker = struct {
                     conn.state = .forwarding;
                     try self.forwardRequest(conn);
                 } else {
-                    // Need a new connection — non-blocking connect via io_uring
                     conn.upstream_fd = try pool_mod.connectNew(conn.upstream, .{});
                     conn.state = .connecting_upstream;
-                    // io_uring connect will fire onConnect when done
-                    // TODO: submit CONNECT SQE through ring
                     std.log.debug("connecting new upstream fd={d}", .{conn.upstream_fd});
                 }
             },
             .forwarding => {
-                // Data from upstream — forward to client
+                // Data arriving from upstream — forward to client
+                const data = conn.req_buf[0..@intCast(bytes)];
                 try self.ring.submitSend(client_fd, data);
+                // Re-arm recv for more upstream data
+                try self.ring.submitRecv(client_fd, &conn.req_buf);
             },
-            else => {},
+            else => {
+                // Re-arm recv to keep the connection alive
+                try self.ring.submitRecv(client_fd, &conn.req_buf);
+            },
         }
     }
 
@@ -191,9 +181,9 @@ pub const Worker = struct {
         const conn = self.conns.getPtr(fd) orelse return;
         if (conn.state == .sending_response) {
             if (conn.keepalive) {
-                // Reset for next request on the same connection
-                conn.state = .reading_request;
+                conn.state  = .reading_request;
                 conn.req_len = 0;
+                try self.ring.submitRecv(fd, &conn.req_buf);
             } else {
                 try self.ring.submitClose(fd);
                 conn.state = .closing;
@@ -202,12 +192,10 @@ pub const Worker = struct {
     }
 
     pub fn onConnect(self: *Worker, upstream_fd: std.posix.fd_t, success: bool) !void {
-        // Find the conn waiting on this upstream fd
         var it = self.conns.valueIterator();
         while (it.next()) |conn| {
             if (conn.upstream_fd == upstream_fd) {
                 if (!success) {
-                    // Mark upstream unhealthy, send 502
                     conn.upstream.healthy.store(false, .release);
                     try self.sendError(conn.client_fd, 502, "Bad Gateway");
                     return;
@@ -223,7 +211,6 @@ pub const Worker = struct {
         if (self.conns.fetchRemove(fd)) |entry| {
             const conn = entry.value;
             if (conn.upstream_fd >= 0) {
-                // Return upstream connection to pool
                 self.local_pool.push(conn.upstream_fd, conn.upstream);
             }
         }
@@ -231,26 +218,23 @@ pub const Worker = struct {
     }
 
     pub fn onTimeout(self: *Worker) !void {
-        // Periodic wakeup — check shutdown flag or perform housekeeping
-        _ = self;
+        if (!shutdown_flag.load(.acquire)) {
+            try self.ring.submitTimeout(100);
+        }
     }
 
     pub fn onError(self: *Worker, fd: std.posix.fd_t, tag: Tag, err: linux.E) !void {
         std.log.debug("worker {d} error fd={d} tag={s} err={s}", .{
             self.wcfg.id, fd, @tagName(tag), @tagName(err),
         });
-        // On recv error, close the connection
         if (tag == .recv or tag == .accept) {
             try self.ring.submitClose(fd);
         }
     }
 
-    // ── Internal helpers ─────────────────────────────────────────────────────
+    // ── Helpers ───────────────────────────────────────────────────────────────
 
     fn forwardRequest(self: *Worker, conn: *Conn) !void {
-        // Re-construct the request and send to upstream.
-        // For now we forward the raw received bytes.
-        // TODO: rewrite Host header, add X-Forwarded-For, strip hop-by-hop headers.
         const raw = conn.req_buf[0..conn.req_len];
         try self.ring.submitSend(conn.upstream_fd, raw);
         conn.state = .forwarding;
@@ -261,7 +245,6 @@ pub const Worker = struct {
     }
 
     fn sendError(self: *Worker, fd: std.posix.fd_t, code: u16, msg: []const u8) !void {
-        // Static response — no allocation
         var buf: [256]u8 = undefined;
         const resp = std.fmt.bufPrint(
             &buf,
@@ -275,13 +258,6 @@ pub const Worker = struct {
 // ── Thread entrypoint ─────────────────────────────────────────────────────────
 
 pub fn workerThread(wcfg: WorkerConfig) void {
-    // Publish our real Linux TID so main() can pin us to a core via
-    // sched_setaffinity without touching opaque pthread handles.
-    if (wcfg.tid_out) |tid_out| {
-        tid_out.store(@as(i32, @bitCast(linux.gettid())), .release);
-    }
-
-    // Use an arena per worker for connection state
     var arena = std.heap.ArenaAllocator.init(wcfg.allocator);
     defer arena.deinit();
 
