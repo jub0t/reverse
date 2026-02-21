@@ -1,4 +1,4 @@
-# Suggest a name guys (avoid the letter "z")
+# Suggest a name guys (without "z" in it)
 
 
 ### Usaage
