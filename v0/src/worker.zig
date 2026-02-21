@@ -230,6 +230,11 @@ pub const Worker = struct {
         std.log.debug("worker {d} closed fd={d}", .{ self.wcfg.id, fd });
     }
 
+    pub fn onTimeout(self: *Worker) !void {
+        // Periodic wakeup — check shutdown flag or perform housekeeping
+        _ = self;
+    }
+
     pub fn onError(self: *Worker, fd: std.posix.fd_t, tag: Tag, err: linux.E) !void {
         std.log.debug("worker {d} error fd={d} tag={s} err={s}", .{
             self.wcfg.id, fd, @tagName(tag), @tagName(err),
