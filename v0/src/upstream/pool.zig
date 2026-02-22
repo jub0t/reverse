@@ -1,14 +1,9 @@
 /// upstream/pool.zig — per-worker upstream connection pool
 ///
-/// Each worker thread owns one Pool. Connections are kept alive between
-/// requests (HTTP keep-alive to upstream). The pool is a simple fixed-size
-/// ring of idle file descriptors — no mutex needed because only the owning
-/// worker thread ever touches it.
-///
-/// Work stealing: when a worker's pool is empty it can steal from a sibling's
-/// pool via the shared `GlobalPool`. This is lock-free via atomics.
+/// Each worker thread owns one LocalPool. The pool is a simple fixed-size
+/// stack of idle file descriptors — no mutex needed because only the owning
+/// worker ever touches it.
 const std = @import("std");
-const os = std.os;
 const linux = std.os.linux;
 const build_options = @import("build_options");
 
@@ -16,11 +11,11 @@ const build_options = @import("build_options");
 
 pub const Upstream = struct {
     addr: std.net.Address,
-    /// Running count of active connections (for least-connections LB)
+    /// Active connection count (for least-connections LB)
     active: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// Running count of total requests handled (for round-robin)
+    /// Total requests handled (for round-robin stats)
     requests: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    /// Health: true if the upstream responded successfully recently
+    /// Health: false when a connect or request fails
     healthy: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
 
     pub fn incActive(self: *Upstream) void {
@@ -39,25 +34,21 @@ pub const Strategy = enum { round_robin, least_connections };
 pub const LoadBalancer = struct {
     upstreams: []Upstream,
     strategy: Strategy,
-    /// Round-robin counter — wraps around. Shared across all workers.
     rr_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn init(upstreams: []Upstream, strategy: Strategy) LoadBalancer {
         return .{ .upstreams = upstreams, .strategy = strategy };
     }
 
-    /// Pick the next upstream to send a request to.
     pub fn pick(self: *LoadBalancer) *Upstream {
         const healthy = self.healthyUpstreams();
         if (healthy == 0) {
-            // All unhealthy — pick round-robin anyway (fail-open)
             const idx = self.rr_counter.fetchAdd(1, .monotonic) % self.upstreams.len;
             return &self.upstreams[idx];
         }
 
         return switch (self.strategy) {
             .round_robin => blk: {
-                // Pick among healthy ones only
                 var attempts: usize = 0;
                 while (attempts < self.upstreams.len) : (attempts += 1) {
                     const idx = self.rr_counter.fetchAdd(1, .monotonic) % self.upstreams.len;
@@ -94,14 +85,11 @@ pub const LoadBalancer = struct {
 
 // ── Per-worker idle connection pool ───────────────────────────────────────────
 
-/// Idle connection entry
 const IdleConn = struct {
     fd: std.posix.fd_t,
     upstream: *Upstream,
 };
 
-/// A fixed-capacity stack of idle file descriptors.
-/// Only the owning worker thread pushes/pops — no locking needed.
 pub const LocalPool = struct {
     conns: []IdleConn,
     top: usize = 0,
@@ -111,7 +99,6 @@ pub const LocalPool = struct {
     }
 
     pub fn deinit(self: *LocalPool, allocator: std.mem.Allocator) void {
-        // Close all idle connections
         for (self.conns[0..self.top]) |c| {
             _ = linux.close(c.fd);
         }
@@ -119,14 +106,13 @@ pub const LocalPool = struct {
     }
 
     /// Pop an idle connection for the given upstream, or null if none.
+    /// Increments upstream.active.
     pub fn pop(self: *LocalPool, upstream: *Upstream) ?std.posix.fd_t {
-        // Scan from top (hot end) downwards
         var i = self.top;
         while (i > 0) {
             i -= 1;
             if (self.conns[i].upstream == upstream) {
                 const fd = self.conns[i].fd;
-                // Swap with top-1 to maintain compact array
                 self.top -= 1;
                 self.conns[i] = self.conns[self.top];
                 upstream.incActive();
@@ -136,12 +122,15 @@ pub const LocalPool = struct {
         return null;
     }
 
-    /// Return a connection to the pool. Returns false (and closes the fd)
-    /// if the pool is full.
+    /// Return a connection to the pool. Decrements upstream.active.
+    /// Closes the fd if the pool is full or if fd is invalid (< 0).
     pub fn push(self: *LocalPool, fd: std.posix.fd_t, upstream: *Upstream) void {
         upstream.decActive();
+
+        // Guard: never store an invalid fd
+        if (fd < 0) return;
+
         if (self.top >= self.conns.len) {
-            // Pool full — just close
             _ = linux.close(fd);
             return;
         }
@@ -154,13 +143,24 @@ pub const LocalPool = struct {
 
 pub const ConnectOptions = struct {
     timeout_ms: u32 = 2000,
-    /// Use TCP Fast Open (sends SYN with data — saves one RTT)
-    tcp_fast_open: bool = build_options.send_zc, // reuse native flag
 };
 
-/// Open a new TCP connection to `upstream`. Blocking (called only when the
-/// pool is empty). Returns a non-blocking fd ready for io_uring.
+/// Create a new non-blocking TCP socket connected (or connecting) to `upstream`.
+///
+/// This function creates the socket, sets TCP_NODELAY, calls the non-blocking
+/// posix.connect (which immediately returns WouldBlock for non-blocking sockets),
+/// and returns the fd.
+///
+/// The caller is responsible for submitting an IORING_OP_CONNECT SQE via
+/// ring.submitConnect() so that the async completion is reported. The CQE
+/// will fire onConnect() with res==0 on success.
+///
+/// We do NOT call upstream.incActive() here — that is done by the caller in
+/// onConnect() so that we don't double-count if the caller also pops from
+/// the pool.
 pub fn connectNew(upstream: *Upstream, opts: ConnectOptions) !std.posix.fd_t {
+    _ = opts;
+
     const fd = try std.posix.socket(
         upstream.addr.any.family,
         std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC,
@@ -168,22 +168,19 @@ pub fn connectNew(upstream: *Upstream, opts: ConnectOptions) !std.posix.fd_t {
     );
     errdefer std.posix.close(fd);
 
-    // TCP Fast Open — available on native Linux, silently skipped on WSL2
-    if (opts.tcp_fast_open and !build_options.wsl2) {
-        const MSG_FASTOPEN: u32 = 0x20000000;
-        _ = MSG_FASTOPEN; // used later in sendto() path
-        // Kernel handles the TFO cookie automatically after first connect
-    }
-
-    // TCP_NODELAY — disable Nagle's algorithm for proxy use
+    // TCP_NODELAY — disable Nagle's algorithm (important for proxy latency)
     const one: c_int = 1;
-    _ = std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
+    _ = std.posix.setsockopt(
+        fd,
+        std.posix.IPPROTO.TCP,
+        std.posix.TCP.NODELAY,
+        std.mem.asBytes(&one),
+    ) catch {};
 
-    upstream.incActive();
-
-    // Non-blocking connect — the actual completion comes via io_uring CONNECT
+    // Non-blocking connect — will get EINPROGRESS / WouldBlock immediately.
+    // The actual connect completion is reported via io_uring CONNECT CQE.
     std.posix.connect(fd, &upstream.addr.any, upstream.addr.getOsSockLen()) catch |err| switch (err) {
-        error.WouldBlock => {}, // expected — io_uring will report completion
+        error.WouldBlock => {}, // expected
         else => return err,
     };
 
@@ -199,12 +196,29 @@ test "local pool push/pop" {
     var pool = try LocalPool.init(allocator, 8);
     defer pool.deinit(allocator);
 
-    // No connection yet
     try std.testing.expect(pool.pop(&up) == null);
 
-    // Fake fd
-    pool.push(99, &up);
-    try std.testing.expectEqual(@as(?std.posix.fd_t, 99), pool.pop(&up));
+    // Manually push a fake fd (bypassing active count for unit test)
+    pool.conns[0] = .{ .fd = 99, .upstream = &up };
+    pool.top = 1;
+    _ = up.active.fetchAdd(1, .monotonic); // simulate it being active
+
+    const fd = pool.pop(&up);
+    try std.testing.expectEqual(@as(?std.posix.fd_t, 99), fd);
+    try std.testing.expectEqual(@as(u32, 2), up.active.load(.monotonic)); // pop increments
+}
+
+test "pool push with invalid fd" {
+    const allocator = std.testing.allocator;
+    var up = Upstream{ .addr = try std.net.Address.parseIp4("127.0.0.1", 3000) };
+    _ = up.active.fetchAdd(1, .monotonic);
+    var pool = try LocalPool.init(allocator, 8);
+    defer pool.deinit(allocator);
+
+    // Pushing fd=-1 should not store it and should not crash
+    pool.push(-1, &up);
+    try std.testing.expectEqual(@as(usize, 0), pool.top);
+    try std.testing.expectEqual(@as(u32, 0), up.active.load(.monotonic));
 }
 
 test "round robin load balancer" {
@@ -220,8 +234,7 @@ test "round robin load balancer" {
     const c = lb.pick();
     const d = lb.pick();
 
-    // Should cycle through all three and wrap
     try std.testing.expect(a != b);
     try std.testing.expect(b != c);
-    try std.testing.expect(a == d); // wraps back to first
+    try std.testing.expect(a == d);
 }

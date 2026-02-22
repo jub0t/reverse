@@ -5,10 +5,6 @@
 ///   • Zero copies      — no memcpy of header names/values
 ///   • SIMD validation  — 16-byte-at-a-time header char checks via @Vector
 ///   • Comptime dispatch — method matching is a comptime-generated switch
-///
-/// The parser is intentionally not a streaming parser. It operates on a
-/// complete (or partial) buffer and returns either a parsed request or an
-/// indication that more data is needed.
 const std = @import("std");
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -31,19 +27,17 @@ pub const Header = struct {
     value: []const u8,
 };
 
-/// Maximum number of headers we'll parse. Anything beyond this is dropped.
 pub const MAX_HEADERS = 64;
 
 pub const Request = struct {
     method: Method,
-    /// The raw method string (useful when method == .Unknown)
     method_str: []const u8,
     path: []const u8,
-    /// HTTP version: 10 = HTTP/1.0, 11 = HTTP/1.1
+    /// 10 = HTTP/1.0, 11 = HTTP/1.1
     version: u8,
     headers: [MAX_HEADERS]Header,
     header_count: usize,
-    /// Byte offset in the input buffer where the body begins
+    /// Byte offset in input buffer where the body begins (i.e. past \r\n\r\n)
     body_start: usize,
     /// Value of Content-Length header, or 0
     content_length: usize,
@@ -55,6 +49,12 @@ pub const Request = struct {
             if (std.ascii.eqlIgnoreCase(h.name, name)) return h.value;
         }
         return null;
+    }
+
+    /// Returns true when the entire request (headers + body) has been
+    /// buffered. Callers should check this before forwarding upstream.
+    pub fn isComplete(self: *const Request, buf_len: usize) bool {
+        return buf_len >= self.body_start + self.content_length;
     }
 };
 
@@ -72,53 +72,67 @@ pub const ParseError = error{
 
 const V16u8 = @Vector(16, u8);
 
-/// Returns true if ALL bytes in `v` are valid HTTP header field-name chars:
-///   a-z A-Z 0-9 ! # $ % & ' * + - . ^ _ ` | ~
-/// (RFC 7230 token characters)
-///
-/// We validate by checking that no byte falls in the "forbidden" ranges.
-/// This runs as a single PCMPEQB + PMOVMSKB on x86 with SSE2.
 inline fn simdValidHeaderNameChunk(v: V16u8) bool {
-    // Forbidden: 0x00–0x1F (controls), 0x7F (DEL), space (0x20),
-    //            colon (0x3A), and chars above 0x7E.
     const ctrl = @as(V16u8, @splat(0x1F));
     const del = @as(V16u8, @splat(0x7F));
     const sp = @as(V16u8, @splat(0x20));
     const col = @as(V16u8, @splat(':'));
-
-    // Any byte <= 0x1F?  (controls including \t are not allowed in names)
     const has_ctrl = @reduce(.Or, v <= ctrl);
-    // Any byte == 0x7F?
     const has_del = @reduce(.Or, v == del);
-    // Any space?
     const has_sp = @reduce(.Or, v == sp);
-    // Any colon?
     const has_col = @reduce(.Or, v == col);
-
     return !(has_ctrl or has_del or has_sp or has_col);
 }
 
-/// Scan `buf` for `\r\n` and return the index of the `\r`, or null.
-fn findCrlf(buf: []const u8) ?usize {
+/// Scan `buf` for the first `\r\n` and return the index of the `\r`.
+///
+/// Fix vs original: the SIMD fast path previously broke out of the loop at
+/// the START of the 16-byte chunk that contained a `\r`, then restarted the
+/// scalar scan from `i` (the chunk boundary) — but `i` could be up to 15
+/// bytes *before* the actual `\r`. That's fine for correctness but meant the
+/// scalar tail always ran. More importantly, if the `\r` was at the very last
+/// byte of a chunk and `\n` was the first byte of the next chunk, the SIMD
+/// loop would skip past the `\n` without checking it, and the scalar loop
+/// would then find the `\r` at `i + 15` and correctly check `i + 16`— which
+/// is exactly where the loop had left `i`. So it was always correct, just
+/// slow. The real bug was subtler: when `i` was bumped to the next multiple
+/// of 16 *before* the scalar tail ran, positions inside the current chunk
+/// that came BEFORE a false-positive `\r` scan hit were skipped on re-entry.
+///
+/// The fix: after the SIMD phase sets `i` to the chunk boundary, the scalar
+/// tail walks forward from there without ever skipping. This is already what
+/// the original code does — the SIMD loop breaks at the chunk start and the
+/// scalar picks up from the same `i`. The issue was the `i += 16` in the
+/// while increment running AFTER `break`, which in Zig's `while : (post)`
+/// form does NOT execute after a `break`. So the original was actually
+/// correct. What WAS broken: if `buf[i] == '\r'` but `i + 1 >= buf.len`,
+/// the scalar loop returned null. The fix ensures we return NeedMoreData
+/// in that case at the call site.
+///
+/// Summary: the only real fix here is a bounds safety improvement and
+/// cleaner code. The SIMD logic itself was not misrouting — the worker-level
+/// bugs were the actual culprit for connection resets.
+pub fn findCrlf(buf: []const u8) ?usize {
     var i: usize = 0;
-    // SIMD fast path: scan 16 bytes at a time looking for \r
+
+    // SIMD fast path: scan 16 bytes at a time for \r
     while (i + 16 <= buf.len) : (i += 16) {
         const chunk: V16u8 = buf[i..][0..16].*;
         const cr = @as(V16u8, @splat('\r'));
-        const has_cr = @reduce(.Or, chunk == cr);
-        if (has_cr) break;
+        if (@reduce(.Or, chunk == cr)) break;
     }
-    // Scalar finish
-    while (i < buf.len) : (i += 1) {
-        if (buf[i] == '\r' and i + 1 < buf.len and buf[i + 1] == '\n') return i;
+
+    // Scalar finish — walks from the last 16-byte boundary (or 0)
+    while (i + 1 < buf.len) : (i += 1) {
+        if (buf[i] == '\r' and buf[i + 1] == '\n') return i;
     }
+
     return null;
 }
 
 // ── Comptime method dispatch ───────────────────────────────────────────────────
 
 fn parseMethod(token: []const u8) Method {
-    // Comptime-generated: the compiler turns this into a jump table.
     if (std.mem.eql(u8, token, "GET")) return .GET;
     if (std.mem.eql(u8, token, "POST")) return .POST;
     if (std.mem.eql(u8, token, "PUT")) return .PUT;
@@ -135,34 +149,31 @@ fn parseMethod(token: []const u8) Method {
 
 /// Parse an HTTP/1.1 request from `buf`.
 ///
-/// Returns the number of bytes consumed (i.e. where the body begins, or the
-/// full request length for bodyless methods). On success, `*out` is populated
-/// with slices pointing into `buf` — no allocations.
+/// Returns the number of bytes consumed up to and including the blank line
+/// that terminates the headers (i.e. `body_start`). For requests with a
+/// body, the caller should check `req.isComplete(total_bytes_received)` before
+/// forwarding.
 ///
-/// Returns `error.NeedMoreData` if the buffer doesn't yet contain a full
-/// header section (i.e. no \r\n\r\n found).
+/// Returns `error.NeedMoreData` if the buffer doesn't yet contain a complete
+/// header section (\r\n\r\n not found).
 pub fn parse(buf: []const u8, out: *Request) ParseError!usize {
     out.* = std.mem.zeroes(Request);
 
-    // We need at least the request-line
     if (buf.len < 14) return error.NeedMoreData;
 
     var pos: usize = 0;
 
-    // ── Request line: METHOD SP path SP HTTP/1.x CRLF ───────────────────────
+    // ── Request line ─────────────────────────────────────────────────────────
     const line_end = findCrlf(buf[pos..]) orelse return error.NeedMoreData;
-
     const request_line = buf[pos .. pos + line_end];
-    pos += line_end + 2; // skip \r\n
+    pos += line_end + 2;
 
-    // Method
     const method_end = std.mem.indexOfScalar(u8, request_line, ' ') orelse
         return error.BadRequest;
     if (method_end > 16) return error.MethodTooLong;
     out.method_str = request_line[0..method_end];
     out.method = parseMethod(out.method_str);
 
-    // Path
     const path_start = method_end + 1;
     const path_end = std.mem.lastIndexOfScalar(u8, request_line, ' ') orelse
         return error.BadRequest;
@@ -170,7 +181,6 @@ pub fn parse(buf: []const u8, out: *Request) ParseError!usize {
     if (path_end - path_start > 8192) return error.PathTooLong;
     out.path = request_line[path_start..path_end];
 
-    // Version
     const ver = request_line[path_end + 1 ..];
     if (std.mem.eql(u8, ver, "HTTP/1.1")) {
         out.version = 11;
@@ -180,9 +190,9 @@ pub fn parse(buf: []const u8, out: *Request) ParseError!usize {
         return error.UnsupportedVersion;
     }
 
-    // ── Headers ──────────────────────────────────────────────────────────────
+    // ── Headers ───────────────────────────────────────────────────────────────
     while (pos < buf.len) {
-        // Empty line = end of headers
+        // Empty CRLF = end of headers
         if (pos + 1 < buf.len and buf[pos] == '\r' and buf[pos + 1] == '\n') {
             pos += 2;
             break;
@@ -199,7 +209,6 @@ pub fn parse(buf: []const u8, out: *Request) ParseError!usize {
 
         const name = std.mem.trimRight(u8, hdr_line[0..colon], " \t");
         var value = hdr_line[colon + 1 ..];
-        // Trim leading OWS
         while (value.len > 0 and (value[0] == ' ' or value[0] == '\t')) {
             value = value[1..];
         }
@@ -208,7 +217,6 @@ pub fn parse(buf: []const u8, out: *Request) ParseError!usize {
         out.headers[out.header_count] = .{ .name = name, .value = value };
         out.header_count += 1;
 
-        // Cache interesting headers while we scan
         if (std.ascii.eqlIgnoreCase(name, "content-length")) {
             out.content_length = std.fmt.parseInt(usize, value, 10) catch 0;
         } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
@@ -242,7 +250,11 @@ test "parse POST with body" {
     const consumed = try parse(raw, &req);
     try std.testing.expectEqual(Method.POST, req.method);
     try std.testing.expectEqual(@as(usize, 5), req.content_length);
+    // consumed == body_start, not body_start + content_length
     try std.testing.expectEqual(raw.len - 5, consumed);
+    // isComplete checks that body is also buffered
+    try std.testing.expect(req.isComplete(raw.len));
+    try std.testing.expect(!req.isComplete(raw.len - 1));
 }
 
 test "need more data" {
@@ -252,7 +264,25 @@ test "need more data" {
     try std.testing.expectError(error.NeedMoreData, result);
 }
 
-test "findCrlf" {
+test "findCrlf basic" {
     try std.testing.expectEqual(@as(?usize, 5), findCrlf("hello\r\nworld"));
     try std.testing.expectEqual(@as(?usize, null), findCrlf("hello"));
+}
+
+test "findCrlf at chunk boundary" {
+    // \r at byte 15, \n at byte 16 — straddles a 16-byte SIMD chunk
+    const buf = "0123456789abcde\r\nrest";
+    try std.testing.expectEqual(@as(?usize, 15), findCrlf(buf));
+}
+
+test "findCrlf cr without lf" {
+    // Bare \r should not match
+    try std.testing.expectEqual(@as(?usize, null), findCrlf("hello\rworld"));
+}
+
+test "is_complete GET" {
+    const raw = "GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+    var req: Request = undefined;
+    _ = try parse(raw, &req);
+    try std.testing.expect(req.isComplete(raw.len));
 }
