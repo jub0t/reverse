@@ -427,8 +427,9 @@ const Parser = struct {
     // ── main parse loop ───────────────────────────────────────────────────
 
     fn parse(self: *Parser) !Document {
-        // Fix up self.cur to point at root (can't take address before return)
         self.cur = &self.root;
+        // Clean up partially-built root if we return an error mid-parse
+        errdefer self.root.deinit(self.allocator);
 
         while (true) {
             self.skipWhitespaceAndComments();
@@ -451,12 +452,17 @@ const Parser = struct {
                 var val = try self.parseValue();
                 errdefer val.deinit(self.allocator);
                 self.skipWhitespace();
-                // allow trailing comment
+                // Allow trailing comment
                 if (self.peek() == '#') self.skipLine();
+                // Allow \r\n (Windows) or \n (Unix) or EOF
                 if (self.peek()) |nl| {
-                    if (nl != '\n' and nl != '\r') return error.ExpectedNewline;
+                    if (nl == '\r') self.advance(); // consume \r
+                    if (self.peek()) |nl2| {
+                        if (nl2 != '\n') return error.ExpectedNewline;
+                    }
+                    // don't advance past \n here — skipWhitespaceAndComments
+                    // will consume it at the top of the next iteration
                 }
-                // put into current table (may already exist for dotted keys)
                 if (self.cur.map.contains(key)) {
                     self.allocator.free(key);
                     val.deinit(self.allocator);

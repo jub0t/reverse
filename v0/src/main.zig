@@ -152,7 +152,7 @@ pub const ServerRuntime = struct {
     }
 
     /// Find a pool by name. Returns null if not found.
-    pub fn findPool(self: *const ServerRuntime, name: []const u8) ?*PoolRuntime {
+    pub fn findPool(self: *ServerRuntime, name: []const u8) ?*PoolRuntime {
         for (self.pools) |*p| {
             if (std.mem.eql(u8, p.name, name)) return p;
         }

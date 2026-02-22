@@ -7,6 +7,9 @@ const std = @import("std");
 const linux = std.os.linux;
 const build_options = @import("build_options");
 
+/// Re-export Strategy from config so callers only need one import.
+pub const Strategy = @import("../config.zig").Strategy;
+
 // ── Upstream address ──────────────────────────────────────────────────────────
 
 pub const Upstream = struct {
@@ -28,8 +31,6 @@ pub const Upstream = struct {
 };
 
 // ── Load balancing ────────────────────────────────────────────────────────────
-
-pub const Strategy = enum { round_robin, least_connections };
 
 pub const LoadBalancer = struct {
     upstreams: []Upstream,
@@ -70,6 +71,12 @@ pub const LoadBalancer = struct {
                     }
                 }
                 break :blk best;
+            },
+            // ip_hash requires the client IP — fall back to round_robin here.
+            // The worker passes the hashed IP via pickWithHash() when available.
+            .ip_hash => blk: {
+                const idx = self.rr_counter.fetchAdd(1, .monotonic) % self.upstreams.len;
+                break :blk &self.upstreams[idx];
             },
         };
     }

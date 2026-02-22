@@ -1,19 +1,9 @@
-# zproxy.toml — example configuration
-# Copy this to zproxy.toml and edit to match your setup.
-# Run: ./zig-out/bin/zproxy zproxy.toml
-
-# ── Global settings ───────────────────────────────────────────────────────────
-
 [global]
-workers = 0               # 0 = one worker per logical CPU
-log_level = "info"        # debug | info | warn | error
+workers = 0
+log_level = "info"
 io_uring_sq_depth = 4096
 io_uring_buf_count = 1024
 io_uring_buf_size = 32768
-
-# ── Server block 1 — main HTTP reverse proxy ──────────────────────────────────
-# Multiple [[server]] blocks are allowed. Each gets its own listen socket.
-# The first block is the default (catches requests with no matching server_name).
 
 [[server]]
 bind = "0.0.0.0"
@@ -21,27 +11,21 @@ port = 8080
 backlog = 4096
 server_name = ["example.com", "www.example.com"]
 
-# ── Timeouts ────────────────────────────────────────────────────────────────
-
 [server.timeouts]
-connect_ms = 2000    # upstream TCP connect timeout
-read_ms = 30000      # upstream read timeout
-write_ms = 30000     # client write timeout
-keepalive_ms = 75000 # HTTP keepalive idle timeout
-
-# ── Upstream pool: "api" ────────────────────────────────────────────────────
-# Multiple [[server.upstream_pool]] blocks allowed per server.
-# Locations reference pools by name.
+connect_ms = 2000
+read_ms = 30000
+write_ms = 30000
+keepalive_ms = 75000
 
 [[server.upstream_pool]]
 name = "api"
-strategy = "round_robin" # round_robin | least_connections | ip_hash
-pool_size = 64           # max idle keepalive connections per upstream per worker
+strategy = "round_robin"
+pool_size = 64
 
 [[server.upstream_pool.upstream]]
 addr = "127.0.0.1:3000"
-weight = 10             # relative weight (for weighted round-robin)
-max_conns = 200         # max concurrent connections (0 = unlimited)
+weight = 10
+max_conns = 200
 
 [[server.upstream_pool.upstream]]
 addr = "127.0.0.1:3001"
@@ -54,8 +38,6 @@ interval_ms = 5000
 timeout_ms = 2000
 path = "/health"
 
-# ── Upstream pool: "static-backend" ─────────────────────────────────────────
-
 [[server.upstream_pool]]
 name = "static-backend"
 strategy = "round_robin"
@@ -64,26 +46,19 @@ pool_size = 16
 [[server.upstream_pool.upstream]]
 addr = "127.0.0.1:4000"
 
-# ── Locations ───────────────────────────────────────────────────────────────
-# Matched top-to-bottom. Longest prefix wins among prefix matches.
-# Exact match always beats prefix.
-
 [[server.location]]
 match = "/api/"
-match_type = "prefix" # prefix | exact | regex
+match_type = "prefix"
 upstream_pool = "api"
 
-# Rate limiting — token bucket per source IP, per worker.
-# Effective global limit = requests_per_second × worker_count.
 [server.location.rate_limit]
 requests_per_second = 100
 burst = 200
-strategy = "token_bucket" # token_bucket | sliding_window
+strategy = "token_bucket"
 
-# Add headers to the request forwarded to upstream
 [[server.location.add_request_header]]
 name = "X-Forwarded-For"
-value = "$remote_addr"   # variables: $remote_addr, $host, $request_id
+value = "$remote_addr"
 
 [[server.location.add_request_header]]
 name = "X-Real-IP"
@@ -93,11 +68,9 @@ value = "$remote_addr"
 name = "X-Request-ID"
 value = "$request_id"
 
-# Strip headers from the request before forwarding
 [[server.location.remove_request_header]]
 name = "X-Internal-Token"
 
-# Add headers to the response sent back to the client
 [[server.location.add_response_header]]
 name = "X-Proxy"
 value = "zproxy"
@@ -106,7 +79,6 @@ value = "zproxy"
 name = "X-Request-ID"
 value = "$request_id"
 
-# Strip headers from the upstream response
 [[server.location.remove_response_header]]
 name = "Server"
 
@@ -118,8 +90,6 @@ match = "/static/"
 match_type = "prefix"
 upstream_pool = "static-backend"
 
-# Static file serving — serve files directly from disk.
-# fallback = true: if the file doesn't exist, proxy to upstream_pool instead.
 [server.location.static]
 root = "/var/www/html"
 fallback = true
@@ -129,7 +99,6 @@ match = "/health"
 match_type = "exact"
 upstream_pool = "api"
 
-# Default location — catches everything else
 [[server.location]]
 match = "/"
 match_type = "prefix"
@@ -142,10 +111,8 @@ value = "$remote_addr"
 [[server.location.remove_response_header]]
 name = "Server"
 
-# ── Server block 2 — admin interface on a separate port ──────────────────────
-
 [[server]]
-bind = "127.0.0.1"               # bind to localhost only
+bind = "127.0.0.1"
 port = 9090
 backlog = 128
 server_name = ["admin.internal"]

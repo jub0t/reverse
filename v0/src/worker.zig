@@ -34,8 +34,11 @@ const Tag = @import("io/ring.zig").Tag;
 const parser = @import("http/parser.zig");
 const pool_mod = @import("upstream/pool.zig");
 const LocalPool = pool_mod.LocalPool;
-const LoadBalancer = pool_mod.LoadBalancer;
-const Config = @import("config.zig").Config;
+const config_mod = @import("config.zig");
+const Config = config_mod.Config;
+const main_mod = @import("main.zig");
+const ServerRuntime = main_mod.ServerRuntime;
+const PoolRuntime = main_mod.PoolRuntime;
 
 /// Global shutdown flag — set by main on Ctrl+C.
 pub var shutdown_flag = std.atomic.Value(bool).init(false);
@@ -83,9 +86,11 @@ const Conn = struct {
 
 pub const WorkerConfig = struct {
     id: u32,
-    listen_fd: std.posix.fd_t,
+    /// One fd per server block — worker arms multishot accept on all of them.
+    listen_fds: []const std.posix.fd_t,
     cfg: *const Config,
-    lb: *LoadBalancer,
+    /// One runtime per server block — holds live LoadBalancers for each pool.
+    server_runtimes: []const ServerRuntime,
     allocator: std.mem.Allocator,
 };
 
@@ -109,17 +114,25 @@ pub const Worker = struct {
     closing_fds: std.AutoHashMap(std.posix.fd_t, void),
 
     pub fn init(wcfg: WorkerConfig) !Worker {
+        // Use the first server's first pool size as the local pool capacity.
+        // Each Conn tracks which pool its upstream belongs to directly.
+        const pool_size: u32 = if (wcfg.server_runtimes.len > 0 and
+            wcfg.server_runtimes[0].pools.len > 0)
+            wcfg.server_runtimes[0].server_cfg.upstream_pools[0].pool_size
+        else
+            64;
+
         const ring_cfg = RingConfig{
-            .sq_depth = wcfg.cfg.io_uring_sq_depth,
-            .buf_count = wcfg.cfg.io_uring_buf_count,
-            .buf_size = wcfg.cfg.io_uring_buf_size,
+            .sq_depth = wcfg.cfg.global.io_uring_sq_depth,
+            .buf_count = wcfg.cfg.global.io_uring_buf_count,
+            .buf_size = wcfg.cfg.global.io_uring_buf_size,
             .buf_group = @intCast(wcfg.id),
         };
 
         var ring = try Ring.init(wcfg.allocator, ring_cfg);
         errdefer ring.deinit();
 
-        var local_pool = try LocalPool.init(wcfg.allocator, wcfg.cfg.upstream.pool_size);
+        var local_pool = try LocalPool.init(wcfg.allocator, pool_size);
         errdefer local_pool.deinit(wcfg.allocator);
 
         return Worker{
@@ -146,11 +159,13 @@ pub const Worker = struct {
     }
 
     pub fn run(self: *Worker) !void {
-        std.log.info("worker {d} starting (listen_fd={d})", .{
-            self.wcfg.id, self.wcfg.listen_fd,
+        std.log.info("worker {d} starting ({d} servers)", .{
+            self.wcfg.id, self.wcfg.listen_fds.len,
         });
 
-        try self.ring.submitMultishotAccept(self.wcfg.listen_fd);
+        for (self.wcfg.listen_fds) |fd| {
+            try self.ring.submitMultishotAccept(fd);
+        }
         try self.ring.submitTimeout(100);
 
         while (!shutdown_flag.load(.acquire)) {
@@ -249,7 +264,43 @@ pub const Worker = struct {
             if (std.ascii.eqlIgnoreCase(v, "keep-alive")) conn.keepalive = true;
         }
 
-        conn.upstream = self.wcfg.lb.pick();
+        // ── Route: match server block by Host header ──────────────────────
+        const host = conn.parsed.header("host") orelse "";
+        const bare_host = if (std.mem.lastIndexOfScalar(u8, host, ':')) |ci| host[0..ci] else host;
+
+        var server_idx: usize = 0; // default: first server block
+        outer: for (self.wcfg.server_runtimes, 0..) |*rt, i| {
+            for (rt.server_cfg.server_name) |name| {
+                if (std.ascii.eqlIgnoreCase(name, bare_host)) {
+                    server_idx = i;
+                    break :outer;
+                }
+                // Wildcard: *.example.com
+                if (std.mem.startsWith(u8, name, "*.")) {
+                    if (std.mem.endsWith(u8, bare_host, name[1..])) {
+                        server_idx = i;
+                        break :outer;
+                    }
+                }
+            }
+        }
+        const srv_rt: *ServerRuntime = @constCast(&self.wcfg.server_runtimes[server_idx]);
+        const srv_cfg = srv_rt.server_cfg;
+
+        // ── Route: match location by path ─────────────────────────────────
+        const loc = config_mod.matchLocation(srv_cfg, conn.parsed.path) orelse {
+            try self.sendErrorToClient(fd, 404, "Not Found");
+            return;
+        };
+
+        // ── Route: resolve upstream pool ──────────────────────────────────
+        const pool_rt = srv_rt.findPool(loc.upstream_pool) orelse {
+            std.log.err("worker {d}: pool '{s}' not found for location '{s}'", .{ self.wcfg.id, loc.upstream_pool, loc.match });
+            try self.sendErrorToClient(fd, 502, "Bad Gateway");
+            return;
+        };
+
+        conn.upstream = pool_rt.lb.pick();
 
         if (self.local_pool.pop(conn.upstream)) |ufd| {
             // Reuse an idle connection from the pool
