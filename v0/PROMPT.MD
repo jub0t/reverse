@@ -1,69 +1,63 @@
-# zproxy — Project Development Prompt
+# zproxy — Project Development Prompt (v2)
 
-Use this prompt at the start of any new development session to restore full context.
+Paste this at the start of any new development session to restore full context.
 
 ---
 
 ## Project Overview
 
-We are building **zproxy** — a high-performance reverse proxy for Linux written in **Zig 0.14.0**, designed to outperform Nginx on throughput, latency, and memory efficiency. It is built around Linux's `io_uring` API and uses modern kernel features unavailable to Nginx.
-
-The project lives at:
-- **Windows path**: `D:\github_repositories\reverse\v0`
-- **WSL2 path**: `/mnt/d/github_repositories/reverse/v0`
+**zproxy** is a high-performance reverse proxy written in **Zig 0.14.0**, targeting Linux. It is built around `io_uring` for maximum throughput and minimum latency, designed to outperform Nginx on throughput, p99 latency, and memory efficiency.
 
 ---
 
-## Developer Environment
+## Environments
 
-- **Host OS**: Windows 10
-- **Development environment**: WSL2 running Ubuntu 24.04.3 LTS
-- **WSL2 Kernel**: 6.6.87.2-microsoft-standard-WSL2 ✅ (supports all required io_uring features)
-- **Terminal**: Ubuntu terminal app (this IS WSL2 — same thing)
-- **Always build and run from WSL2 terminal**, never from PowerShell
-- **Zig version**: 0.14.0 (Linux x86_64 binary inside WSL2)
-- **Testing on native Linux**: Ubuntu laptop (used for features that WSL2 can't support)
+| Environment | Details |
+|---|---|
+| Dev machine | Windows 10, Ubuntu 24.04.3 LTS via WSL2 |
+| WSL2 kernel | 6.6.87.2-microsoft-standard-WSL2 |
+| Test machine | Ubuntu laptop (native Linux, full feature set) |
+| Zig version | 0.14.0 (Linux x86_64 binary at `~/zig-linux-x86_64-0.14.0/`) |
+| Project path (WSL2) | `/mnt/d/github_repositories/reverse/v0` |
+| Project path (laptop) | `~/Github/reverse/v0` |
+| Zig installed (laptop) | `/usr/local/zig-0.14.0/` |
 
----
-
-## Performance Goals
-
-| Metric                  | Nginx (tuned)    | zproxy target   |
-| ----------------------- | ---------------- | --------------- |
-| Accept throughput       | ~200K conn/s     | ~800K–1M conn/s |
-| p99 latency             | ~2–5ms           | ~200–500µs      |
-| Memory per connection   | ~25KB            | ~4–8KB          |
-| TLS overhead            | High (user copy) | Low (kTLS)      |
-| Pass-through throughput | ~40Gbps          | ~100Gbps+       |
+**Always build and run from the Ubuntu/WSL2 terminal, never PowerShell.**
 
 ---
 
-## Architecture
+## Build Commands
 
+```bash
+# WSL2 development
+zig build -Dwsl2=true
+
+# WSL2 tests
+zig build test -Dwsl2=true
+
+# Native Linux — full feature set
+zig build -Doptimize=ReleaseFast
+
+# Run
+./zig-out/bin/zproxy
+
+# Run with config file
+./zig-out/bin/zproxy zproxy.zon
 ```
-SO_REUSEPORT + CBPF Steering
-        │
-        ├── Worker 0 (core 0)    ├── Worker N (core N)
-        │   io_uring ring        │   io_uring ring
-        │   - multishot accept   │   - multishot accept
-        │   - multishot recv     │   - multishot recv
-        │   - provided buf ring  │   - provided buf ring
-        │   - SEND_ZC (native)   │   - SEND_ZC (native)
-        │   - registered FDs     │   - registered FDs
-        │   Local upstream pool  │   Local upstream pool
-        │
-        ├── SIMD HTTP/1.1 + HTTP/2 Parser
-        │   - AVX2 header validation
-        │   - zero-allocation, zero-copy
-        │   - comptime method dispatch
-        │
-        ├── Routing Decision
-        │   ├── Inspect path  →  Upstream Pool (TFO + work-steal)
-        │   └── Pass-through  →  eBPF SOCKMAP (kernel splice, native only)
-        │
-        └── kTLS (native only)
-            sendfile/splice work on plaintext
-```
+
+---
+
+## Feature Flags (build.zig)
+
+| Flag | WSL2 | Native | Description |
+|---|---|---|---|
+| `-Dwsl2=true` | true | false | Master WSL2 toggle |
+| `sockmap` | false | true | eBPF SOCKMAP (auto-set from wsl2) |
+| `ktls` | false | true | Kernel TLS (auto-set from wsl2) |
+| `numa` | false | true | NUMA-aware alloc (auto-set from wsl2) |
+| `send_zc` | false | true | Zero-copy send (auto-set from wsl2) |
+| `-Dsqpoll=true` | false | false | Kernel SQ polling (needs root) |
+| `-Dtls=true` | false | false | TLS via BoringSSL (WIP) |
 
 ---
 
@@ -73,119 +67,140 @@ SO_REUSEPORT + CBPF Steering
 reverse/v0/
 ├── build.zig               # Build system + feature flags
 ├── build.zig.zon           # Package manifest
-├── README.md               # Setup and architecture docs
+├── zproxy.zon              # Runtime config file (optional)
 └── src/
-    ├── main.zig            # Entry point, socket setup, worker spawning, signals
-    ├── worker.zig          # Per-CPU worker thread + io_uring CQE dispatch loop
-    ├── config.zig          # Config types + ZON file loader
+    ├── main.zig            # Entry point, socket, workers, signals
+    ├── worker.zig          # Per-CPU worker + CQE dispatch loop
+    ├── config.zig          # Config types + ZON loader stub
     ├── io/
-    │   └── ring.zig        # io_uring abstraction (multishot, provided bufs, SEND_ZC)
+    │   └── ring.zig        # io_uring abstraction
     ├── http/
-    │   └── parser.zig      # SIMD HTTP/1.1 parser (zero-alloc, zero-copy)
+    │   └── parser.zig      # SIMD HTTP/1.1 parser
     └── upstream/
-        └── pool.zig        # Connection pool + round-robin/least-conn load balancer
+        └── pool.zig        # Connection pool + load balancer
 ```
 
 ---
 
-## Build System — Feature Flags
+## build.zig.zon (correct format for Zig 0.14.0)
 
-```bash
-# WSL2 development (disables: SOCKMAP, kTLS, NUMA, SEND_ZC)
-zig build -Dwsl2=true
-
-# Native Linux — full feature set
-zig build -Doptimize=ReleaseFast
-
-# SQPOLL mode (dedicates a kernel thread, needs root/CAP_SYS_NICE)
-sudo zig build -Dsqpoll=true -Doptimize=ReleaseFast
-
-# Run tests
-zig build test -Dwsl2=true
+```zig
+.{
+    .name = .zproxy,
+    .fingerprint = 0xae2bb1a7aa8888cb,
+    .version = "0.0.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
 ```
 
-Feature flags defined in `build.zig`:
+---
 
-| Flag      | WSL2 default | Native default | Effect                             |
-| --------- | ------------ | -------------- | ---------------------------------- |
-| `wsl2`    | true         | false          | Master toggle for WSL2 limitations |
-| `sockmap` | false        | true           | eBPF SOCKMAP kernel splice         |
-| `ktls`    | false        | true           | Kernel TLS offload                 |
-| `numa`    | false        | true           | NUMA-aware memory allocation       |
-| `send_zc` | false        | true           | Zero-copy send (SEND_ZC)           |
-| `sqpoll`  | false        | false          | Kernel-side SQ polling             |
-| `tls`     | false        | false          | TLS support via BoringSSL          |
+## Architecture
+
+```
+SO_REUSEPORT listen socket (shared across all workers)
+        │
+        ├── Worker 0 (core 0)   ├── Worker N (core N)
+        │   io_uring ring       │   io_uring ring
+        │   - multishot accept  │   - multishot accept
+        │   - per-conn recv     │   - per-conn recv
+        │   - send / send_zc    │   - send / send_zc
+        │   - 100ms timeout     │   - 100ms timeout
+        │   Local upstream pool │   Local upstream pool
+        │
+        ├── SIMD HTTP/1.1 Parser (zero-alloc, zero-copy)
+        │
+        ├── Round-robin / Least-connections Load Balancer
+        │
+        └── Upstream TCP connections (keepalive pool per worker)
+```
 
 ---
 
-## Key Technical Decisions
+## Key Design Decisions Made During Development
 
-### io_uring Strategy
-- **Multishot accept**: Submit once on listen_fd, kernel fires CQE per new connection forever
-- **Multishot recv + provided buffer rings**: Kernel selects buffer at receive time — no per-socket pre-allocation. Buffer pool registered via `IORING_REGISTER_PBUF_RING`
-- **SEND_ZC** (`IORING_OP_SEND_ZC`): Zero-copy send for response bodies > 16KB (native only)
-- **Registered FDs**: Pre-register upstream socket FDs to eliminate atomic ref-count on every SQE
-- **SQPOLL** (optional): Dedicated kernel thread polls SQ — eliminates `io_uring_enter` syscall entirely
+### io_uring recv strategy
+**Provided buffer rings were removed.** The original design used `IORING_REGISTER_PBUF_RING` (kernel selects buffer at recv time). This failed in practice — when the buffer ring isn't set up correctly, recv CQEs complete with `res=0` (no buffer available), which was being misread as EOF and closing connections immediately.
 
-### Threading Model
-- One worker thread per logical CPU (`std.Thread.getCpuCount()`)
-- Each worker owns its own io_uring ring — no cross-thread ring sharing
-- Workers share only the read-only `Config` and atomic counters in `Upstream`
-- CPU pinning via `sched_setaffinity` (native Linux only)
-- `SO_REUSEPORT` — kernel load-balances incoming connections across all workers
+**Current approach**: Each `Conn` struct owns an 8KB `req_buf[8192]u8`. On accept, we get a stable pointer to that buffer and pass it directly to `submitRecv`. This is simpler, works on both WSL2 and native Linux, and has no hidden failure modes.
 
-### HTTP Parser (`src/http/parser.zig`)
-- Uses Zig `@Vector(16, u8)` for SIMD 16-byte-at-a-time scanning
-- Zero allocations — all output is slices into the input buffer
-- Zero copies — no memcpy of header names/values
-- Comptime method dispatch (GET/POST/PUT etc → jump table)
-- Returns `error.NeedMoreData` for partial buffers (safe for streaming)
+Provided buffer rings can be re-added later as an optimization once the core proxy logic is working.
 
-### Upstream Connection Pool (`src/upstream/pool.zig`)
-- Per-worker `LocalPool` — fixed-size ring of idle fds, no mutex needed
-- `LoadBalancer` supports `round_robin` and `least_connections`
-- Atomic health tracking per upstream (`Upstream.healthy`)
-- TCP Fast Open to upstreams (native Linux — saves one RTT on cold connections)
-- TCP_NODELAY always set on upstream connections
+### Shutdown mechanism
+Workers block in `io_uring_enter` (a blocking syscall). To shut them down cleanly:
+- A global `shutdown_flag: std.atomic.Value(bool)` is shared across all workers
+- Each worker submits a recurring `TIMEOUT` SQE (100ms interval) so the event loop wakes up periodically
+- On `onTimeout()`, the worker checks `shutdown_flag` and resubmits the timeout if not shutting down
+- On Ctrl+C, `main()` sets `shutdown_flag = true` and closes the listen socket
+- Workers exit their `while (!shutdown_flag.load(...))` loop within 100ms
 
-### WSL2 vs Native Linux
-Features are compile-time disabled on WSL2 via `build_options`:
-- **eBPF SOCKMAP**: Not supported in WSL2 at all
-- **kTLS**: Unreliable on WSL2
-- **NUMA allocation**: Irrelevant (WSL2 is a single VM)
-- **SEND_ZC**: Hyper-V vNIC limitation
-- **CPU pinning**: Skipped on WSL2
+**tkill approach was abandoned** — `t.impl.handle` on WSL2/pthreads returns a `*pthread_t` opaque pointer, not a Linux TID. Getting the real TID requires the worker to publish it via an atomic at startup, which added complexity. The timeout polling approach is simpler and reliable.
 
----
+### CQE dispatch
+User-data encoding in SQEs:
+- Top 8 bits = `Tag` enum (accept/recv/send/connect/close/timeout/nop)
+- Bottom 56 bits = file descriptor (i32 bitcast to u32, zero-extended)
 
-## What Is Already Implemented
+`waitAndDispatch` handles:
+- `res <= 0`: if `res < 0` → error path, if `res == 0` → EOF → call `onClose`
+- `tag == .timeout` → call `onTimeout` (checked before error path since -ETIME is normal)
+- All other tags dispatched normally
 
-- [x] `io/ring.zig` — full io_uring abstraction with multishot accept, multishot recv, provided buffer rings, SEND_ZC, CQE dispatcher
-- [x] `http/parser.zig` — SIMD HTTP/1.1 parser with full test suite
-- [x] `upstream/pool.zig` — per-worker keepalive pool, round-robin + least-connections LB, atomic health
-- [x] `worker.zig` — per-CPU event loop owning ring + pool, full connection state machine
-- [x] `main.zig` — `SO_REUSEPORT` listen socket, worker spawning, CPU pinning, SIGINT/SIGTERM handler
-- [x] `config.zig` — config types and ZON loader stub
-- [x] `build.zig` — feature flag system for WSL2 vs native Linux
+### Zig 0.14.0 API differences from original code
+Several APIs moved or changed in 0.14.0:
+- `std.os.*` → `std.posix.*` (socket, bind, listen, close, setsockopt, etc.)
+- `os.fd_t` → `std.posix.fd_t`
+- `linux.getErrno()` → `std.posix.errno()`
+- `os.unexpectedErrno()` → `std.posix.unexpectedErrno()`
+- `linux.IoUring.init(entries, flags)` — entries is `u16`, not `u32` (use `@intCast`)
+- `linux.IORING_REGISTER` is an enum — use `.REGISTER_PBUF_RING` not a raw `u32`
+- `linux.IORING_OP` is an enum — use `.ACCEPT`, `.RECV`, `.SEND`, `.CLOSE`, etc.
+- `linux.O.NONBLOCK` is a packed struct field — use `std.posix.O{ .NONBLOCK = true }`
+- `std.posix.sigaction()` does not return an error union — no `catch {}` needed
+- `io_uring.enter()` returns an error union — use `_ = try self.ring.enter(...)`
+- `build.zig.zon` requires `.name = .zproxy` (enum literal) and `.fingerprint` field
 
 ---
 
-## What Needs To Be Built Next (in priority order)
+## Current Status
 
-1. **Fix compilation errors** — wire up remaining Zig 0.14.0 API differences (IoUring method names, sigaction API, fcntl constants)
-2. **Upstream recv path** — when upstream sends a response, forward it back to the client
-3. **Header rewriting** — add `X-Forwarded-For`, rewrite `Host`, strip hop-by-hop headers
-4. **ZON config parser** — replace the stub in `config.zig` with actual `std.zon.parseFromSlice`
-5. **Health checker** — periodic TCP connect to each upstream, update `Upstream.healthy`
-6. **HTTP/2 support** — HPACK header compression + frame parsing
-7. **kTLS** — after BoringSSL handshake, push session keys to kernel via `setsockopt(TCP_ULP, "tls")`
-8. **eBPF SOCKMAP** — load BPF program for kernel-level socket splicing (WebSocket, CONNECT tunnels)
-9. **Metrics endpoint** — `/metrics` returning per-worker stats in Prometheus format
-10. **NUMA-aware allocation** — `mbind()` for buffer pools on multi-socket servers
+### Working
+- [x] Compiles clean on both WSL2 (`-Dwsl2=true`) and native Linux (`-Doptimize=ReleaseFast`)
+- [x] All tests pass (`zig build test -Dwsl2=true`)
+- [x] 4 workers start, each with its own io_uring ring
+- [x] Multishot accept armed on listen socket
+- [x] Ctrl+C exits cleanly (shutdown_flag + timeout polling)
+- [x] Accepts TCP connections from curl
+- [x] Per-connection recv buffer wired up correctly
+
+### In Progress / Known Issues
+- [ ] `Connection reset by peer` — proxy accepts connection but response path is incomplete
+- [ ] Upstream connect SQE not yet submitted via io_uring (uses blocking `connectNew`)
+- [ ] Response from upstream not forwarded back to client yet
+- [ ] `onConnect` CQE handler not wired to the ring (TODO comment in worker.zig)
+
+### Next Steps (in priority order)
+1. **Fix upstream connect** — submit `IORING_OP_CONNECT` SQE via ring instead of blocking connect
+2. **Wire upstream recv** — after connect, arm recv on upstream_fd to get response
+3. **Forward response** — when upstream recv fires, send data back to client_fd
+4. **Test end-to-end** — `curl http://localhost:8080/` should return Python HTTP server response
+5. **Header rewriting** — add `X-Forwarded-For`, rewrite `Host`, strip hop-by-hop headers
+6. **ZON config parser** — replace stub in `config.zig` with real `std.zon.parseFromSlice`
+7. **Health checker** — periodic TCP ping to each upstream, update `Upstream.healthy`
+8. **HTTP/2** — HPACK + frame parsing
+9. **kTLS** — push session keys to kernel after BoringSSL handshake
+10. **eBPF SOCKMAP** — kernel splice for WebSocket/CONNECT pass-through
 
 ---
 
 ## Config File Format (`zproxy.zon`)
+
+The ZON parser is currently stubbed — it loads the file but uses hardcoded defaults. The config types in `config.zig` define the intended format:
 
 ```zig
 .{
@@ -195,11 +210,11 @@ Features are compile-time disabled on WSL2 via `build_options`:
     .backlog = 4096,
     .io_uring_sq_depth = 4096,
     .io_uring_buf_count = 1024,
-    .io_uring_buf_size = 32768,      // 32KB per buffer
+    .io_uring_buf_size = 32768,
     .upstream = .{
         .addrs = .{ "127.0.0.1:3000", "127.0.0.1:3001" },
         .strategy = .round_robin,    // or .least_connections
-        .pool_size = 64,             // idle connections per upstream per worker
+        .pool_size = 64,
         .connect_timeout_ms = 2000,
         .keepalive = true,
         .tcp_fast_open = true,
@@ -209,23 +224,35 @@ Features are compile-time disabled on WSL2 via `build_options`:
 }
 ```
 
+Default upstream (used when no config file found): `127.0.0.1:3000`
+
 ---
 
-## CQE Dispatch Flow
+## Testing
 
-```
-io_uring CQE arrives
-        │
-        ├── tag = .accept   → onAccept()  → store Conn, submitMultishotRecv()
-        ├── tag = .recv     → onRecv()    → parse HTTP or forward upstream data
-        ├── tag = .send     → onSend()    → keepalive reset or close
-        ├── tag = .connect  → onConnect() → forwardRequest() or send 502
-        └── tag = .close    → onClose()   → return upstream conn to pool
+```bash
+# Terminal 1 — fake backend
+python3 -m http.server 3000
+
+# Terminal 2 — proxy
+./zig-out/bin/zproxy
+
+# Terminal 3 — test
+curl -v http://localhost:8080/
+curl -v http://localhost:8080/ http://localhost:8080/ http://localhost:8080/
 ```
 
-User-data encoding in SQEs (u64):
-- Top 8 bits = Tag enum (accept/recv/send/connect/close)
-- Bottom 56 bits = file descriptor (i32 bitcast to u32, zero-extended)
+---
+
+## Performance Goals
+
+| Metric | Nginx (tuned) | zproxy target |
+|---|---|---|
+| Accept throughput | ~200K conn/s | ~800K–1M conn/s |
+| p99 latency | ~2–5ms | ~200–500µs |
+| Memory per connection | ~25KB | ~4–8KB |
+| TLS overhead | High (user copy) | Low (kTLS) |
+| Pass-through throughput | ~40Gbps | ~100Gbps+ (SOCKMAP) |
 
 ---
 
@@ -233,7 +260,6 @@ User-data encoding in SQEs (u64):
 
 - Zig 0.14.0 release notes: https://ziglang.org/download/0.14.0/release-notes.html
 - io_uring docs: https://kernel.dk/io_uring.pdf
-- io_uring multishot + provided buffers: https://lwn.net/Articles/879758/
+- io_uring multishot: https://lwn.net/Articles/879758/
 - eBPF SOCKMAP: https://lwn.net/Articles/731133/
 - kTLS: https://www.kernel.org/doc/html/latest/networking/tls.html
-- Nginx source (for reference): https://github.com/nginx/nginx
