@@ -137,6 +137,10 @@ pub const ServerConfig = struct {
     upstream_pools: []UpstreamPoolConfig,
     locations: []LocationConfig = &.{},
     timeouts: TimeoutConfig = .{},
+    /// Path to TLS certificate chain (PEM). Null = plaintext.
+    tls_cert: ?[]const u8 = null,
+    /// Path to TLS private key (PEM). Null = plaintext.
+    tls_key: ?[]const u8 = null,
 };
 
 /// Global settings that apply to the whole process.
@@ -327,6 +331,12 @@ fn readServer(allocator: std.mem.Allocator, doc: *const toml.Document, idx: usiz
     s.upstream_pools = try readUpstreamPools(allocator, doc, base);
     s.locations = try readLocations(allocator, doc, base);
     s.timeouts = try readTimeouts(doc, base, allocator);
+
+    // TLS cert/key paths
+    if (doc.getString(try std.fmt.allocPrint(allocator, "{s}.tls_cert", .{base}))) |v|
+        s.tls_cert = try allocator.dupe(u8, v);
+    if (doc.getString(try std.fmt.allocPrint(allocator, "{s}.tls_key", .{base}))) |v|
+        s.tls_key = try allocator.dupe(u8, v);
 
     return s;
 }

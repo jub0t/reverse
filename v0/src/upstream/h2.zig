@@ -739,6 +739,50 @@ pub const H2Conn = struct {
     }
 };
 
+// ── H2Upstream — pool-level wrapper ──────────────────────────────────────────
+
+/// Manages one H2Conn to a single upstream address.
+/// MVP: one TCP connection, up to remote_max_concurrent streams.
+pub const H2Upstream = struct {
+    conn: ?*H2Conn = null,
+    allocator: std.mem.Allocator,
+    upstream: *pool_mod.Upstream,
+
+    pub fn init(allocator: std.mem.Allocator, upstream: *pool_mod.Upstream) H2Upstream {
+        return .{ .allocator = allocator, .upstream = upstream };
+    }
+
+    pub fn deinit(self: *H2Upstream) void {
+        if (self.conn) |c| {
+            c.deinit();
+            self.allocator.destroy(c);
+            self.conn = null;
+        }
+    }
+
+    /// Acquire the shared H2Conn, creating it if needed.
+    /// When `is_new` is true, the caller must submit a TCP connect SQE then
+    /// send the connection preface via `buildPreface`.
+    pub fn acquireConn(self: *H2Upstream) !struct { conn: *H2Conn, is_new: bool } {
+        if (self.conn) |c| return .{ .conn = c, .is_new = false };
+
+        const fd = try pool_mod.connectNew(self.upstream, .{});
+        const c = try self.allocator.create(H2Conn);
+        c.* = H2Conn.init(fd, self.allocator);
+        self.conn = c;
+        return .{ .conn = c, .is_new = true };
+    }
+
+    /// Drop the current H2Conn (e.g. GOAWAY received or TCP error).
+    pub fn dropConn(self: *H2Upstream) void {
+        if (self.conn) |c| {
+            c.deinit();
+            self.allocator.destroy(c);
+            self.conn = null;
+        }
+    }
+};
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 test "FrameHeader encode/decode round-trip" {
